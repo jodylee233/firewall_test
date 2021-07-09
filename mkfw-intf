@@ -1,0 +1,94 @@
+#!/bin/bash
+CHAIN_NAME="FORWARD"
+SYSCONFIG="/etc/sysconfig/network-scripts"
+
+
+usage () {
+        echo
+        echo "Usage: mkfw-intf 'IN/OUT/MGMT' 'interface' 'ip address' {'tablename'} {'tableid'} {'gateway'}"
+        echo "Examples: "
+        echo "          > mkfw-intf in eth0 10.1.2.1/24 "
+        echo
+}
+
+
+if [ "x$1" = "x" -o "y$2" = "y" -o "z$3" = "z" ]; then
+	echo "Incorrect number of arguments"
+	echo
+	usage
+	exit
+fi
+
+DIRECTION=$(echo $1 |tr [:lower:] [:upper:])
+INT=$(echo $2 |tr [:upper:] [:lower:])
+TABLE=$(echo $4 |tr [:upper:] [:lower:])
+TABLEID=$5
+GATEWAY=$(echo $6 |tr [:upper:] [:lower:])
+
+if [ $DIRECTION != "IN" -a $DIRECTION != "OUT" -a $DIRECTION != "MGMT" ]; then
+	echo "Incorrect first arguement"
+	usage
+	exit
+fi
+
+
+# Delete Any Previous Rules For Interface
+LINE=$(iptables -L $CHAIN_NAME -nv --line-numbers |awk "\$8 ~ /^$2\$/ {print \$1}")
+if [ "x$LINE" != "x" ]; then
+	iptables -D $CHAIN_NAME $LINE
+fi
+
+# Bring up interface on boot
+cat > $SYSCONFIG/ifcfg-$INT <<-ENDCAT
+TYPE=Ethernet
+BOOTPROTO=none
+DEVICE=$INT
+ONBOOT=yes
+ETHTOOL_OPTS=" -G $INT rx 4096; -G $INT tx 4096"
+ENDCAT
+
+
+
+forwarding=0
+# Insert iptables rule
+if [ $DIRECTION != "MGMT" ]; then
+	iptables -I $CHAIN_NAME -o $2 -j ${DIRECTION}BOUND
+	forwarding=1
+  if [ "x$TABLE" != "x" ]
+  then
+    echo "fwmark $((TABLEID)) lookup $TABLE" > $SYSCONFIG/rule-$INT
+    echo "0.0.0.0/0 via $GATEWAY table $TABLE " > $SYSCONFIG/route-$INT
+  fi
+
+
+  if [ $DIRECTION == "IN" ]; then
+    iptables -t mangle -I PREROUTING -i $2 -j OUTBOUND
+  fi
+else
+  LINE=$(iptables -L INPUT -nv --line-numbers | tail -1 | awk '{print $1}')
+  iptables -I INPUT $LINE -i $2 -j ACCEPT
+
+  if [ "x$TABLE" != "x" ]
+  then
+    echo "fwmark $((TABLEID)) lookup $TABLE" > $SYSCONFIG/rule-$INT
+    echo "iif lo to 172.16.0.0/12 lookup $TABLE " >> $SYSCONFIG/rule-$INT
+    echo "0.0.0.0/0 via $GATEWAY table $TABLE " > $SYSCONFIG/route-$INT
+  fi
+
+fi
+
+
+#set sysctl variable for forwarding or not.
+cat > /etc/sysctl.d/$INT.conf <<END
+net.ipv4.conf.$INT.forwarding = $forwarding
+net.ipv4.conf.$INT.rp_filter = 0
+END
+
+sysctl -w net.ipv4.conf.$INT.forwarding=$forwarding
+sysctl -w net.ipv4.conf.$INT.rp_filter=0
+
+
+## SET IP Address
+vtysh -c "conf term" -c "int $2" -c "ip address $3" -c "end" -c "copy run start"
+
+service iptables save

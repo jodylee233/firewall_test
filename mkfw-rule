@@ -1,0 +1,97 @@
+#!/bin/bash
+
+LOGFILE=/var/log/fwchangelog
+COMMAND=mkfw-rule
+log() {
+   message="$@"
+   echo "$(date +%c) $COMMAND $message">>$LOGFILE
+   logger -t $COMMAND "$message"
+}
+
+help() {
+  echo
+  echo "Usage: mkfw-rule (in|out) ip protocol port source"
+  echo "Example: mkfw-rule in 172.16.3.151 tcp 80 any"
+  echo
+  echo "IP: all, default, IP address or a Network."
+  echo "Protocol: Protocol number or name.  see /etc/protocols "
+  echo "Port: 0-65535, or 0 for protocols other than tcp/udp"
+  echo "Source: any, IP address, ipset:[ipset-name]"
+  echo
+  exit
+}
+NARGS=$(echo $@ | wc -w)
+if [ $NARGS -ne 5 ]; then
+        echo "Incorrect number os arguments"
+        help
+fi
+
+PROTOCOL=$3
+
+
+if [ "x$1" == "xin" ]; then
+  DIRECTION="INBOUND"
+elif [ "x$1" == "xout" ]; then
+  DIRECTION="OUTBOUND"
+else
+  echo "Arg 1: in or out ($1)"
+  help
+fi
+
+IPSET=$DIRECTION-$2-$PROTOCOL-$4
+
+if [ $4 -eq 0 ]; then
+  PORT=""
+elif [ $4 -gt 0 -a $4 -lt 65536 ]; then
+  PORT=" --dport  $4 "
+else
+  echo "Port is invalid ($4)"
+  help
+fi
+
+IP=$2
+if [ $2 = "all" ]; then
+  IP=$(iptables -L OUTBOUND -nv | awk '{print $8}' | grep '^[0-9]')
+elif [ $2 = "default" ]; then
+  IP=$(echo $2 |tr [:lower:] [:upper:])
+fi
+
+SOURCE=$5
+if [ "x$SOURCE" == "xany" ]; then
+  SOURCE=" -s 0.0.0.0/0 "
+elif [ ${SOURCE#ipset:} != $SOURCE ]; then
+  if [ ! $(ipset list ${SOURCE#ipset:}) ] ; then
+      echo "ipset ${SOURCE#ipset:} doesn't exist."
+      exit
+  else
+    SOURCE=" -m set --match-set ${SOURCE#ipset:} src "
+  fi
+else
+  SOURCE=" -s $5 "
+  ipset create $IPSET hash:net counters
+  ipset add $IPSET $5
+fi
+
+echo "SOURCE=$SOURCE"
+for i in $IP
+do
+
+  CHAIN=$DIRECTION-$i
+  iptables -L $CHAIN -nv > /dev/null 2>&1
+  if [ $? -ne 0 ]; then
+        echo
+        echo "No IP Rule for $CHAIN"
+        echo "Check that this IP has been defined with mkfw-ip using lsfw $i"
+        echo
+        exit
+  fi
+
+
+  LNUM=$(iptables -L $CHAIN -nv --line-numbers | tail -1 | awk '{print $1}')
+  iptables -I $CHAIN $LNUM -p $PROTOCOL $PORT $SOURCE -j ACCEPT
+  log iptables -I $CHAIN $LNUM -p $PROTOCOL $PORT $SOURCE -j ACCEPT
+
+
+
+
+done
